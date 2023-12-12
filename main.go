@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 var showMetadata bool
+var retrieveAsset bool
 
 type Metadata struct {
 	links  int
@@ -21,47 +24,97 @@ type Metadata struct {
 	took   time.Duration
 }
 
-func fetch(link string, filename string) (*Metadata, error) {
+func fetchToFile(uri *url.URL, filename string) ([]byte, error) {
 	client := http.DefaultClient
 	client.Timeout = time.Second * 10
 	//not using client.Get in order to support custom http headers and methods if needed in the future
-	req, err := http.NewRequest(http.MethodGet, link, nil)
+	req, err := http.NewRequest(http.MethodGet, uri.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err = os.WriteFile(filename, body, 0644); err != nil {
+		return nil, err
+	}
+	return body, nil
+
+}
+func fetch(uri *url.URL, filename string) (*Metadata, error) {
+	start := time.Now()
+	body, err := fetchToFile(uri, filename)
+	if err != nil {
+		return nil, err
+	}
 	took := time.Now().Sub(start)
 
 	//preferred way would have been to use io.Copy but I need to read the body twice to extract metadata
-	body, err := io.ReadAll(resp.Body)
+
+	tree, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	var meta *Metadata
-	if showMetadata {
+	images := getAllTags(tree, "img")
+	if retrieveAsset {
+		for _, img := range images {
+			for _, attr := range img.Attr {
+				fmt.Println(attr)
+				if attr.Key == "src" {
+					//If the href is not a valid url then it means it's a relative path
+					nurl, err := url.Parse(attr.Val)
+					if err != nil {
+						*nurl = *uri
+						nurl.Path = attr.Val
+					}
+					fetchToFile(nurl, attr.Val)
+				}
+			}
+		}
 
-		// golang.org/x/net/html to parse the actual page and retrieve just the tags we're interested in
+	}
+
+	if showMetadata {
 		// a more scalable solution would be to use something like
-		linksnum := bytes.Count(body, []byte("href"))
-		imgnum := bytes.Count(body, []byte("<img"))
+		// golang.org/x/net/html to parse the actual page and retrieve just the tags we're interested in
+		//linksnum := bytes.Count(body, []byte("</a>"))
+		linksnum := len(getAllTags(tree, "a"))
+		//imgnum := bytes.Count(body, []byte("<img"))
 		meta = &Metadata{
 			links:  linksnum,
-			images: imgnum,
-			host:   link,
+			images: len(images),
+			host:   uri.Hostname(),
 			took:   took,
 		}
-	}
-	if err = os.WriteFile(filename, body, 0644); err != nil {
-		return nil, err
 	}
 	return meta, nil
 }
 
+// Walk the html tree to find all occurrences of the specified tag
+func getAllTags(node *html.Node, tag string) []*html.Node {
+	var res []*html.Node
+	nodestack := []*html.Node{node}
+	for len(nodestack) > 0 {
+		node = nodestack[0]
+		nodestack = nodestack[1:]
+		if node.FirstChild != nil {
+			nodestack = append(nodestack, node.FirstChild)
+		}
+		if node.NextSibling != nil {
+			nodestack = append(nodestack, node.NextSibling)
+		}
+		if node.Data == tag && node.Type == html.ElementNode {
+			res = append(res, node)
+		}
+	}
+	return res
+}
+
+// Worker that synchronously prints metadata
 func printMetadata(inch <-chan Metadata, donech chan<- bool) {
 	for meta := range inch {
 		fmt.Println("-------------------------")
@@ -73,9 +126,10 @@ func printMetadata(inch <-chan Metadata, donech chan<- bool) {
 	donech <- true
 }
 
-func dispatchFetch(link, filename string, outch chan<- Metadata, wg *sync.WaitGroup) {
+func dispatchFetch(murl *url.URL, filename string, outch chan<- Metadata, wg *sync.WaitGroup) {
 	defer wg.Done()
-	data, err := fetch(link, filename)
+	link := murl.String()
+	data, err := fetch(murl, filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error while fetching %s: %s\n", link, err.Error())
 		return
@@ -86,9 +140,11 @@ func dispatchFetch(link, filename string, outch chan<- Metadata, wg *sync.WaitGr
 }
 func init() {
 	metaUsage := "Show metadata of calls"
+	assetUsage := "Retrieve assets together with webpage"
 	flag.BoolVar(&showMetadata, "metadata", false, metaUsage)
 	flag.BoolVar(&showMetadata, "m", false, metaUsage+" (shorthand)")
-
+	flag.BoolVar(&retrieveAsset, "assets", false, assetUsage)
+	flag.BoolVar(&retrieveAsset, "a", false, assetUsage+" (shorthand)")
 }
 
 func main() {
@@ -98,7 +154,6 @@ func main() {
 		links = append(links, flag.Arg(i))
 	}
 	metachannel := make(chan Metadata, 16)
-
 	var wg sync.WaitGroup
 	//Another waitgroup would have been just as effective
 	donech := make(chan bool)
@@ -106,10 +161,15 @@ func main() {
 	for _, link := range links {
 		//If I wanted to support automatic content-type detection I could
 		//either use http.DetectContentType or just read the header, it seemed out of scope
-		filename := strings.TrimPrefix(link, "https://")
-		filename = strings.TrimPrefix(filename, "http://")
+		url, err := url.Parse(link)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Invalid url:", err.Error())
+			//Looks more go-ish
+			continue
+		}
 		wg.Add(1)
-		go dispatchFetch(link, filename+".html", metachannel, &wg)
+		filename := url.Host + url.EscapedPath()
+		go dispatchFetch(url, filename+".html", metachannel, &wg)
 	}
 	//After all the fetches have been performed I can close the metachannel and avoid deadlocking
 	wg.Wait()
