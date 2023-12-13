@@ -72,7 +72,6 @@ func fetch(uri *url.URL, filename string) (*Metadata, error) {
 	if retrieveAsset {
 		for _, img := range images {
 			for _, attr := range img.Attr {
-				fmt.Println(attr)
 				if attr.Key == "src" {
 					nurl, err := url.Parse(attr.Val)
 					//skip the asset
