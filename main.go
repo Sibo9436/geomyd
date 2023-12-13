@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 var showMetadata bool
 var retrieveAsset bool
+var serve bool
 
 type Metadata struct {
 	links  int
@@ -44,6 +46,13 @@ func fetchToFile(uri *url.URL, filename string) ([]byte, error) {
 	return body, nil
 
 }
+
+func buildDirStructure(path string) error {
+	dirs := strings.Split(path, "/")
+	path = strings.Join(dirs[0:len(dirs)-1], "/")
+	return os.MkdirAll(path, 0750)
+}
+
 func fetch(uri *url.URL, filename string) (*Metadata, error) {
 	start := time.Now()
 	body, err := fetchToFile(uri, filename)
@@ -65,13 +74,31 @@ func fetch(uri *url.URL, filename string) (*Metadata, error) {
 			for _, attr := range img.Attr {
 				fmt.Println(attr)
 				if attr.Key == "src" {
-					//If the href is not a valid url then it means it's a relative path
 					nurl, err := url.Parse(attr.Val)
+					//skip the asset
 					if err != nil {
-						*nurl = *uri
-						nurl.Path = attr.Val
+						continue
 					}
-					fetchToFile(nurl, attr.Val)
+					//If host is "" -> url is relative
+					//if not we skip the asset
+					if nurl.Host != "" {
+						continue
+					}
+					*nurl = *uri
+					nurl.Path = attr.Val
+					path := attr.Val
+					if strings.HasPrefix(path, "/") {
+						path = path[1:]
+					}
+					err = buildDirStructure(path)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "Error while storing asset", attr.Val, err.Error())
+						continue
+					}
+					_, err = fetchToFile(nurl, path)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "Error while storing asset", attr.Val, err.Error())
+					}
 				}
 			}
 		}
