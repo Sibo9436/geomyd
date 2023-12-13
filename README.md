@@ -3,7 +3,8 @@ A web-fetcher and some
 ## How to 
 The easiest way to get it up and running is running
 ```bash
-docker build -t geomyd 
+cd geomyd
+docker build -t geomyd .
 alias geomyd='docker run --rm -v .:/usr/src/geomyd:Z geomyd'
 geomyd --help
 ```
